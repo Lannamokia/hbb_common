@@ -51,6 +51,12 @@ pub use machine_uid;
 pub use serde_derive;
 pub use serde_json;
 pub use sha2;
+// vhd-machine-auth-bridge: re-export the `hmac` crate so that
+// `src/vhd_bridge/hmac.rs` can address `hbb_common::hmac::Hmac` without
+// the root crate adding `hmac` directly. Gated on the bridge feature
+// to keep non-bridge builds free of the dependency.
+#[cfg(feature = "vhd-bridge")]
+pub use hmac;
 pub use sysinfo;
 pub use thiserror;
 pub use toml;
@@ -425,48 +431,65 @@ pub fn is_domain_port_str(id: &str) -> bool {
 }
 
 pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHandle> {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    #[allow(unused_mut)]
-    let mut logger_holder: Option<flexi_logger::LoggerHandle> = None;
-    INIT.call_once(|| {
-        #[cfg(debug_assertions)]
-        {
-            use env_logger::*;
-            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"));
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            // https://docs.rs/flexi_logger/latest/flexi_logger/error_info/index.html#write
-            // though async logger more efficient, but it also causes more problems, disable it for now
-            let mut path = config::Config::log_path();
-            #[cfg(target_os = "android")]
-            if !config::Config::get_home().exists() {
-                return;
+    // vhd-machine-auth-bridge (task 10.3, Requirements 18.1 / 18.8):
+    // when the bridge is compiled in on Windows, RustDesk's existing
+    // local file logger SHALL be a no-op so logs only flow through
+    // the named-pipe sink installed by `vhd_bridge::install_log_sink`
+    // (task 10.1). Skipping the body here also avoids racing the
+    // global `log::set_boxed_logger` registration with the bridge
+    // sink, which is registered later by `vhd_bridge::start` and
+    // owns its own `log::set_max_level` (so the existing level
+    // filter strategy is not lowered).
+    #[cfg(all(target_os = "windows", feature = "vhd-bridge"))]
+    {
+        let _ = (_is_async, _name);
+        return None;
+    }
+    #[cfg(not(all(target_os = "windows", feature = "vhd-bridge")))]
+    {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        #[allow(unused_mut)]
+        let mut logger_holder: Option<flexi_logger::LoggerHandle> = None;
+        INIT.call_once(|| {
+            #[cfg(debug_assertions)]
+            {
+                use env_logger::*;
+                init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"));
             }
-            if !_name.is_empty() {
-                path.push(_name);
+            #[cfg(not(debug_assertions))]
+            {
+                // https://docs.rs/flexi_logger/latest/flexi_logger/error_info/index.html#write
+                // though async logger more efficient, but it also causes more problems, disable it for now
+                let mut path = config::Config::log_path();
+                #[cfg(target_os = "android")]
+                if !config::Config::get_home().exists() {
+                    return;
+                }
+                if !_name.is_empty() {
+                    path.push(_name);
+                }
+                use flexi_logger::*;
+                if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn") {
+                    logger_holder = x
+                        .log_to_file(FileSpec::default().directory(path))
+                        .write_mode(if _is_async {
+                            WriteMode::Async
+                        } else {
+                            WriteMode::Direct
+                        })
+                        .format(opt_format)
+                        .rotate(
+                            Criterion::Age(Age::Day),
+                            Naming::Timestamps,
+                            Cleanup::KeepLogFiles(31),
+                        )
+                        .start()
+                        .ok();
+                }
             }
-            use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn") {
-                logger_holder = x
-                    .log_to_file(FileSpec::default().directory(path))
-                    .write_mode(if _is_async {
-                        WriteMode::Async
-                    } else {
-                        WriteMode::Direct
-                    })
-                    .format(opt_format)
-                    .rotate(
-                        Criterion::Age(Age::Day),
-                        Naming::Timestamps,
-                        Cleanup::KeepLogFiles(31),
-                    )
-                    .start()
-                    .ok();
-            }
-        }
-    });
-    logger_holder
+        });
+        logger_holder
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

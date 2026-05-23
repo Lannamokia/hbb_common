@@ -20,6 +20,12 @@ use sha2::{Digest, Sha256};
 use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
 
+// vhd-machine-auth-bridge §17.4: under `controlled-only` the recent-peer
+// encrypt/decrypt helpers (`decrypt_vec_or_original` / `encrypt_vec_or_original`)
+// become unused because `PeerConfig::load` / `PeerConfig::store_` are gated to
+// no-ops. Default builds still need them, so suppress the unused-import warning
+// at the use block instead of dropping the names from the list.
+#[cfg_attr(feature = "controlled-only", allow(unused_imports))]
 use crate::{
     compress::{compress, decompress},
     log,
@@ -104,6 +110,17 @@ lazy_static::lazy_static! {
     static ref CONFIG2: RwLock<Config2> = RwLock::new(Config2::load());
     static ref LOCAL_CONFIG: RwLock<LocalConfig> = RwLock::new(LocalConfig::load());
     static ref STATUS: RwLock<Status> = RwLock::new(Status::load());
+    // vhd-machine-auth-bridge §18.3 / Requirement 21.5: under
+    // `controlled-only` / `vhd-bridge` the trusted-devices read / write
+    // paths collapse to no-ops, so this in-memory cache is never touched.
+    // Keep the static (so the type / `lazy_static!` block stays
+    // structurally identical between forms) but allow `dead_code` under
+    // the cropped flavors so the compiler does not warn about an unused
+    // global.
+    #[cfg_attr(
+        any(feature = "controlled-only", feature = "vhd-bridge"),
+        allow(dead_code)
+    )]
     static ref TRUSTED_DEVICES: RwLock<(Vec<TrustedDevice>, bool)> = Default::default();
     static ref ONLINE: Mutex<HashMap<String, i64>> = Default::default();
     pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("".to_owned());
@@ -156,11 +173,35 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+// vhd-machine-auth-bridge §1.2b: `RENDEZVOUS_SERVERS` / `RS_PUB_KEY` accept a
+// compile-time injection from the Build_Prereq_Vars gate.  When `HBBS_HOST` /
+// `HBBS_KEY` are provided to `build.rs` (env or `secret.sec` fallback), the
+// hbb_common build script emits `cargo:rustc-env=RUSTDESK_RENDEZVOUS_SERVER`
+// / `cargo:rustc-env=RUSTDESK_RS_PUB_KEY` and these `option_env!` calls pick
+// them up.  When the env var is unset, `option_env!` returns `None` and the
+// legacy hard-coded values apply unchanged — preserving existing builds
+// (Requirement 22.10).  The build script never emits the env when the value
+// would be empty, so we don't need a runtime is_empty check here.
+pub const RENDEZVOUS_SERVERS: &[&str] = &[match option_env!("RUSTDESK_RENDEZVOUS_SERVER") {
+    Some(s) => s,
+    None => "rs-ny.rustdesk.com",
+}];
+pub const RS_PUB_KEY: &str = match option_env!("RUSTDESK_RS_PUB_KEY") {
+    Some(s) => s,
+    None => "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=",
+};
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
+// vhd-machine-auth-bridge §1.2b: compile-time fallback for the
+// `relay-server` option when no value is configured at runtime *and* the
+// rendezvous server didn't push one.  Empty string means "no compile-time
+// default — use the existing `host[:port+1]` heuristic".  See
+// `libs/hbb_common/build.rs::inject_build_prereq_vars`.
+pub const RELAY_SERVER_DEFAULT: &str = match option_env!("RUSTDESK_RELAY_SERVER") {
+    Some(s) => s,
+    None => "",
+};
 pub const WS_RENDEZVOUS_PORT: i32 = 21118;
 pub const WS_RELAY_PORT: i32 = 21119;
 
@@ -976,6 +1017,23 @@ impl Config {
         }
         config.id = id.into();
         config.store();
+        // vhd-machine-auth-bridge task 9.1 / Requirements 7.2, 13.7, 14.6:
+        // observer-only notification on the ID generation/persistence path.
+        // The root crate's `src/vhd_bridge/triggers.rs` registers a callback
+        // here via `set_id_hook(...)` during process startup (task 14.1);
+        // until it is registered, this call is a silent no-op so that
+        // `hbb_common` keeps no compile- or run-time dependency on the root
+        // crate. The bridge lives in the root crate (`src/vhd_bridge/`),
+        // so a direct `vhd_bridge::triggers::notify_id_change()` call from
+        // here would be a crate-level circular dependency — the
+        // indirection through an `OnceLock<fn()>` hook is the minimal
+        // observer-only plumbing that keeps Requirement 13.7's
+        // "SHALL NOT modify existing ID generation / persistence logic"
+        // intact.
+        #[cfg(all(target_os = "windows", feature = "vhd-bridge"))]
+        if let Some(f) = SET_ID_HOOK.get() {
+            f();
+        }
     }
 
     pub fn set_nat_type(nat_type: i32) {
@@ -1218,6 +1276,25 @@ impl Config {
 
     pub fn set_options(mut v: HashMap<String, String>) {
         Self::purify_options(&mut v);
+        // vhd-machine-auth-bridge §18.2 / Requirement 21.3 — under the
+        // controlled-only / vhd-bridge feature flavors the
+        // `"2fa"` and `OPTION_ENABLE_TRUSTED_DEVICES` keys are constant
+        // empty values at the source. Strip them out of the bulk write
+        // before persistence so neither a config-sync push nor a CLI
+        // override can re-enable 2FA / trusted-devices behind the back
+        // of §18.1's `get_2fa` collapse.
+        #[cfg(any(feature = "controlled-only", feature = "vhd-bridge"))]
+        v.retain(|k, _| {
+            if is_2fa_disabled_option_key(k) {
+                log::warn!(
+                    "vhd_bridge: refused write to 2fa-related config key '{}'",
+                    k
+                );
+                false
+            } else {
+                true
+            }
+        });
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
             return;
@@ -1241,6 +1318,22 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
+        // vhd-machine-auth-bridge §18.2 / Requirement 21.3 — refuse writes
+        // to `"2fa"` and `OPTION_ENABLE_TRUSTED_DEVICES` at the single
+        // `Config` write entry-point. This closes the back door left by
+        // §18.1 (`get_2fa` returning `None`): even if persisted config,
+        // an IPC config-sync push, a CLI flag, or `HARD_SETTINGS` carries
+        // a value, the value never reaches `CONFIG2.options` and is never
+        // persisted. Read paths therefore observe a constant empty value.
+        #[cfg(any(feature = "controlled-only", feature = "vhd-bridge"))]
+        if is_2fa_disabled_option_key(&k) {
+            log::warn!(
+                "vhd_bridge: refused write to 2fa-related config key '{}'",
+                k
+            );
+            let _ = v;
+            return;
+        }
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
             let mut config = CONFIG2.write().unwrap();
             if config.options.remove(&k).is_some() {
@@ -1537,10 +1630,28 @@ impl Config {
     }
 
     pub fn get_trusted_devices_json() -> String {
+        // vhd-machine-auth-bridge §18.3 / Requirement 21.5: under
+        // `controlled-only` / `vhd-bridge`, `get_trusted_devices` returns an
+        // empty `Vec`, so this helper deterministically yields `"[]"` without
+        // touching the encrypted persistent slot. Signature kept so IPC /
+        // Flutter / UI callers (`src/ipc.rs`, `flutter_ffi::main_get_trusted_devices`)
+        // need no `cfg` sprinkles.
         serde_json::to_string(&Self::get_trusted_devices()).unwrap_or_default()
     }
 
     pub fn get_trusted_devices() -> Vec<TrustedDevice> {
+        // vhd-machine-auth-bridge §18.3 / Requirement 21.5: under
+        // `controlled-only` / `vhd-bridge`, the trusted-devices read path is
+        // collapsed to an empty `Vec` so the被控端 never grows an hwid trust
+        // cache at runtime. The encrypted `CONFIG2.trusted_devices` slot on
+        // disk SHALL NOT be touched, so binaries stay swappable between forms
+        // without losing user data.
+        #[cfg(any(feature = "controlled-only", feature = "vhd-bridge"))]
+        {
+            return Vec::new();
+        }
+        #[cfg(not(any(feature = "controlled-only", feature = "vhd-bridge")))]
+        {
         let (devices, synced) = TRUSTED_DEVICES.read().unwrap().clone();
         if synced {
             return devices;
@@ -1560,8 +1671,16 @@ impl Config {
         } else {
             Default::default()
         }
+        }
     }
 
+    // vhd-machine-auth-bridge §18.3: declaration is conditionally compiled
+    // out under the cropped forms because `add_/remove_/clear_trusted_devices`
+    // — its only callers — are themselves emptied. Keeping the function
+    // would yield a `dead_code` warning. The `TrustedDevice` type is also
+    // never constructed under the cropped forms (the read path returns an
+    // empty `Vec`), so writers do not need a stub.
+    #[cfg(not(any(feature = "controlled-only", feature = "vhd-bridge")))]
     fn set_trusted_devices(mut trusted_devices: Vec<TrustedDevice>) {
         trusted_devices.retain(|d| !d.outdate());
         let devices = serde_json::to_string(&trusted_devices).unwrap_or_default();
@@ -1578,20 +1697,56 @@ impl Config {
     }
 
     pub fn add_trusted_device(device: TrustedDevice) {
+        // vhd-machine-auth-bridge §18.3 / Requirement 21.5: write path is a
+        // no-op under `controlled-only` / `vhd-bridge`. The `device` argument
+        // is intentionally consumed-and-dropped so callers (e.g.
+        // `src/server/connection.rs` 2FA `accepted` branch) compile unchanged.
+        #[cfg(any(feature = "controlled-only", feature = "vhd-bridge"))]
+        {
+            let _ = device;
+            return;
+        }
+        #[cfg(not(any(feature = "controlled-only", feature = "vhd-bridge")))]
+        {
         let mut devices = Self::get_trusted_devices();
         devices.retain(|d| d.hwid != device.hwid);
         devices.push(device);
         Self::set_trusted_devices(devices);
+        }
     }
 
     pub fn remove_trusted_devices(hwids: &Vec<Bytes>) {
+        // vhd-machine-auth-bridge §18.3 / Requirement 21.5: delete path is a
+        // no-op under `controlled-only` / `vhd-bridge`. IPC / Flutter callers
+        // (`Data::RemoveTrustedDevices`, `flutter_ffi::main_remove_trusted_devices`)
+        // remain wired but become observably inert.
+        #[cfg(any(feature = "controlled-only", feature = "vhd-bridge"))]
+        {
+            let _ = hwids;
+            return;
+        }
+        #[cfg(not(any(feature = "controlled-only", feature = "vhd-bridge")))]
+        {
         let mut devices = Self::get_trusted_devices();
         devices.retain(|d| !hwids.contains(&d.hwid));
         Self::set_trusted_devices(devices);
+        }
     }
 
     pub fn clear_trusted_devices() {
+        // vhd-machine-auth-bridge §18.3 / Requirement 21.5: clear path is a
+        // no-op under `controlled-only` / `vhd-bridge`. Called from
+        // `set_permanent_password` / `set_salt`; under the cropped forms the
+        // already-empty in-memory cache stays empty and the encrypted on-disk
+        // slot is left untouched (preserving data across binary swaps).
+        #[cfg(any(feature = "controlled-only", feature = "vhd-bridge"))]
+        {
+            return;
+        }
+        #[cfg(not(any(feature = "controlled-only", feature = "vhd-bridge")))]
+        {
         Self::set_trusted_devices(Default::default());
+        }
     }
 
     pub fn get() -> Config {
@@ -1647,6 +1802,19 @@ const PEERS: &str = "peers";
 
 impl PeerConfig {
     pub fn load(id: &str) -> PeerConfig {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.2:
+        // controlled-only 形态下"最近连接"持久化路径被裁剪。
+        // 保留签名以避免编译期波及调用方；返回 `PeerConfig::default()`，
+        // 让上层的 `info.platform.is_empty()` 检测把这些条目过滤为空。
+        // 不删除磁盘上的 peers/*.toml，使二进制在 controlled-only 与
+        // 主控端形态间互换时保留用户既有数据。
+        #[cfg(feature = "controlled-only")]
+        {
+            let _ = id;
+            return PeerConfig::default();
+        }
+        #[cfg(not(feature = "controlled-only"))]
+        {
         let _lock = CONFIG.read().unwrap();
         match confy::load_path(Self::path(id)) {
             Ok(config) => {
@@ -1679,14 +1847,38 @@ impl PeerConfig {
                 Default::default()
             }
         }
+        }
     }
 
     pub fn store(&self, id: &str) {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.2: controlled-only
+        // 形态下 "最近连接" 写入路径被裁剪为 no-op。签名保留，调用方无需
+        // 散落 cfg；磁盘上既有的 peers/*.toml SHALL NOT 被覆盖或删除。
+        #[cfg(feature = "controlled-only")]
+        {
+            let _ = id;
+            return;
+        }
+        #[cfg(not(feature = "controlled-only"))]
+        {
         let _lock = CONFIG.read().unwrap();
         self.store_(id);
+        }
     }
 
+    #[cfg_attr(feature = "controlled-only", allow(dead_code))]
     fn store_(&self, id: &str) {
+        // vhd-machine-auth-bridge §17.4: under controlled-only this method
+        // is unreachable from the gated `store`/`load` paths. Marking it
+        // `cfg(not(controlled-only))` avoids dead-code warnings while keeping
+        // the original implementation untouched for default builds.
+        #[cfg(feature = "controlled-only")]
+        {
+            let _ = id;
+            return;
+        }
+        #[cfg(not(feature = "controlled-only"))]
+        {
         let mut config = self.clone();
         config.password =
             encrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
@@ -1699,14 +1891,23 @@ impl PeerConfig {
             log::error!("Failed to store config: {}", err);
         }
         NEW_STORED_PEER_CONFIG.lock().unwrap().insert(id.to_owned());
+        }
     }
 
     pub fn remove(id: &str) {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.2: controlled-only
+        // 形态下 "最近连接" 删除路径被裁剪为 no-op，与 `store` 一致以保留
+        // 二进制互换时的用户数据。
+        #[cfg(feature = "controlled-only")]
+        {
+            let _ = id;
+            return;
+        }
+        #[cfg(not(feature = "controlled-only"))]
         fs::remove_file(Self::path(id)).ok();
     }
 
     fn path(id: &str) -> PathBuf {
-        //If the id contains invalid chars, encode it
         let forbidden_paths = Regex::new(r".*[<>:/\\|\?\*].*");
         let path: PathBuf;
         if let Ok(forbidden_paths) = forbidden_paths {
@@ -1784,11 +1985,13 @@ impl PeerConfig {
     }
 
     #[inline]
+    #[cfg(not(feature = "controlled-only"))]
     async fn preload_file_async(path: PathBuf) {
         let _ = tokio::fs::File::open(path).await;
     }
 
     #[tokio::main(flavor = "current_thread")]
+    #[cfg(not(feature = "controlled-only"))]
     async fn preload_peers_async() {
         let now = std::time::Instant::now();
         let vec_id_modified_time_path = Self::get_vec_id_modified_time_path(&None);
@@ -1823,12 +2026,29 @@ impl PeerConfig {
     // So we have to preload all peers in a background thread to avoid the delay when opening the file the first time.
     // We can temporarily stop "Microsoft Defender Antivirus Service" or add the fold to the white list, to verify this. But don't do this in the release version.
     pub fn preload_peers() {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.2: controlled-only
+        // 形态下 "最近连接" 读取路径已裁剪为空，预加载也成为 no-op，避免
+        // 后台线程访问 peers/*.toml。
+        #[cfg(feature = "controlled-only")]
+        return;
+        #[cfg(not(feature = "controlled-only"))]
         std::thread::spawn(|| {
             Self::preload_peers_async();
         });
     }
 
     pub fn peers(id_filters: Option<Vec<String>>) -> Vec<(String, SystemTime, PeerConfig)> {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.2:
+        // controlled-only 形态下 "最近连接" 读取路径裁剪为返回空列表。
+        // 签名保留，使调用方（`flutter_ffi::main_load_*`、`ui::*` 等）无需
+        // 散落 cfg。磁盘上既有的 peers/*.toml 不会被读取，但也不会被删除。
+        #[cfg(feature = "controlled-only")]
+        {
+            let _ = id_filters;
+            return Vec::new();
+        }
+        #[cfg(not(feature = "controlled-only"))]
+        {
         let vec_id_modified_time_path = Self::get_vec_id_modified_time_path(&id_filters);
         Self::batch_peers(
             &vec_id_modified_time_path,
@@ -1836,6 +2056,7 @@ impl PeerConfig {
             Some(vec_id_modified_time_path.len()),
         )
         .0
+        }
     }
 
     pub fn batch_peers(
@@ -1843,6 +2064,16 @@ impl PeerConfig {
         from: usize,
         to: Option<usize>,
     ) -> (Vec<(String, SystemTime, PeerConfig)>, usize) {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.2:
+        // controlled-only 形态下批量加载路径同样返回空列表 + `from`，与
+        // `peers()` 保持一致。
+        #[cfg(feature = "controlled-only")]
+        {
+            let _ = (all, to);
+            return (Vec::new(), from);
+        }
+        #[cfg(not(feature = "controlled-only"))]
+        {
         if from >= all.len() {
             return (vec![], 0);
         }
@@ -1869,6 +2100,7 @@ impl PeerConfig {
             .filter(|p| !p.2.info.platform.is_empty())
             .collect();
         (peers, to)
+        }
     }
 
     pub fn exists(id: &str) -> bool {
@@ -2132,15 +2364,32 @@ impl LocalConfig {
     }
 
     pub fn set_fav(fav: Vec<String>) {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.3: controlled-only
+        // 形态下 "收藏" 写入路径裁剪为 no-op，签名保留，本机 _local config
+        // 既有的 fav 字段不会被覆盖。
+        #[cfg(feature = "controlled-only")]
+        {
+            let _ = fav;
+            return;
+        }
+        #[cfg(not(feature = "controlled-only"))]
+        {
         let mut lock = LOCAL_CONFIG.write().unwrap();
         if lock.fav == fav {
             return;
         }
         lock.fav = fav;
         lock.store();
+        }
     }
 
     pub fn get_fav() -> Vec<String> {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.3: controlled-only
+        // 形态下 "收藏" 读取路径裁剪为返回空列表，避免发起方 UI 加载收藏集
+        // 触发后续的 PeerConfig::peers 路径。
+        #[cfg(feature = "controlled-only")]
+        return Vec::new();
+        #[cfg(not(feature = "controlled-only"))]
         LOCAL_CONFIG.read().unwrap().fav.clone()
     }
 
@@ -2250,6 +2499,14 @@ pub struct LanPeers {
 
 impl LanPeers {
     pub fn load() -> LanPeers {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.5: controlled-only
+        // 形态下 "主动 LAN 发现" 读取路径裁剪为返回空列表。被动 `pong`
+        // 应答（`crate::lan::start_listening`）由任务 17.5 单独保留。
+        // 不删除磁盘上既有的 _lan_peers 文件，使二进制互换时保留用户数据。
+        #[cfg(feature = "controlled-only")]
+        return LanPeers::default();
+        #[cfg(not(feature = "controlled-only"))]
+        {
         let _lock = CONFIG.read().unwrap();
         match confy::load_path(Config::file_("_lan_peers")) {
             Ok(peers) => peers,
@@ -2258,14 +2515,25 @@ impl LanPeers {
                 Default::default()
             }
         }
+        }
     }
 
     pub fn store(peers: &[DiscoveryPeer]) {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.5: controlled-only
+        // 形态下 "主动 LAN 发现" 写入路径裁剪为 no-op。
+        #[cfg(feature = "controlled-only")]
+        {
+            let _ = peers;
+            return;
+        }
+        #[cfg(not(feature = "controlled-only"))]
+        {
         let f = LanPeers {
             peers: peers.to_owned(),
         };
         if let Err(err) = store_path(Config::file_("_lan_peers"), f) {
             log::error!("Failed to store lan peers: {}", err);
+        }
         }
     }
 
@@ -2480,12 +2748,23 @@ pub struct Ab {
 }
 
 impl Ab {
+    #[cfg_attr(feature = "controlled-only", allow(dead_code))]
     fn path() -> PathBuf {
         let filename = format!("{}_ab", APP_NAME.read().unwrap().clone());
         Config::path(filename)
     }
 
     pub fn store(json: String) {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.4: controlled-only
+        // 形态下 "地址簿" 写入路径裁剪为 no-op。本机磁盘上既有的 *_ab
+        // 文件 SHALL NOT 被覆盖或删除，便于二进制形态间互换保留用户数据。
+        #[cfg(feature = "controlled-only")]
+        {
+            let _ = json;
+            return;
+        }
+        #[cfg(not(feature = "controlled-only"))]
+        {
         if let Ok(mut file) = std::fs::File::create(Self::path()) {
             let data = compress(json.as_bytes());
             let max_len = 64 * 1024 * 1024;
@@ -2498,9 +2777,17 @@ impl Ab {
                 file.write_all(&data).ok();
             }
         };
+        }
     }
 
     pub fn load() -> Ab {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.4: controlled-only
+        // 形态下 "地址簿" 读取路径裁剪为返回空 `Ab`，避免触发 hbbs `/api/ab/*`
+        // 接口的 HTTP 客户端调用与 `try_get_password_from_personal_ab` 路径。
+        #[cfg(feature = "controlled-only")]
+        return Ab::default();
+        #[cfg(not(feature = "controlled-only"))]
+        {
         if let Ok(mut file) = std::fs::File::open(Self::path()) {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
@@ -2514,9 +2801,15 @@ impl Ab {
         };
         Self::remove();
         Ab::default()
+        }
     }
 
     pub fn remove() {
+        // vhd-machine-auth-bridge §17.4 / Requirement 20.4: controlled-only
+        // 形态下 "地址簿" 删除路径裁剪为 no-op，与 `store` 一致。
+        #[cfg(feature = "controlled-only")]
+        return;
+        #[cfg(not(feature = "controlled-only"))]
         std::fs::remove_file(Self::path()).ok();
     }
 }
@@ -2715,6 +3008,19 @@ fn is_option_can_save(
     true
 }
 
+// vhd-machine-auth-bridge §18.2 / Requirement 21.3 — keys that are
+// explicitly disabled at the `Config` write entry-point under the
+// `controlled-only` / `vhd-bridge` feature flavors. The `verify2fa`
+// flow stores its TOTP secret under `"2fa"` (see `src/auth_2fa.rs`),
+// and `OPTION_ENABLE_TRUSTED_DEVICES` controls hwid trusted-device
+// caching — both are constant empty values in the controlled-only
+// build (Requirement 21.3).
+#[cfg(any(feature = "controlled-only", feature = "vhd-bridge"))]
+#[inline]
+fn is_2fa_disabled_option_key(k: &str) -> bool {
+    k == "2fa" || k == keys::OPTION_ENABLE_TRUSTED_DEVICES
+}
+
 #[inline]
 pub fn is_incoming_only() -> bool {
     HARD_SETTINGS
@@ -2792,6 +3098,302 @@ pub fn use_ws() -> bool {
 pub fn allow_insecure_tls_fallback() -> bool {
     let option = keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK;
     option2bool(option, &Config::get_option(option))
+}
+
+// vhd-machine-auth-bridge: Bridge_Config（Requirement 4.1 / 4.2 / 13.6）
+//
+// 仅 RustDesk_Controlled (Windows + feature = "vhd-bridge") 形态下存在；
+// 其它形态产物不会包含本结构、其字段名或默认值字符串。
+//
+// 字段集合严格限于 design.md §"Bridge_Config" 列出的四项，**不**包含
+// `enabled` / `registration_certificate_path` 等被需求 4.2 显式禁止的开关；
+// 桥接是否启用由编译特性硬编码为 true，不存在运行期开关。
+//
+// `secret_version` 默认值在 hbb_common 这一层先保留为 1；真正的编译期注入
+// 常量 (`SHARED_SECRET_VERSION`) 由根 crate `src/vhd_bridge/secret.rs`
+// 通过 `include!(concat!(env!("OUT_DIR"), "/vhd_bridge_secret_version.rs"))`
+// 暴露——hbb_common 自身没有 vhd-bridge 专属的 build.rs 注入入口，
+// 把"链接到注入常量"的副作用留在根 crate 是为了让 hbb_common 在
+// 关闭桥接特性时编译期完全独立（避免引入跨 crate 的脆弱 OUT_DIR 依赖）。
+#[cfg(all(windows, feature = "vhd-bridge"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeConfig {
+    #[serde(default = "BridgeConfig::default_pipe_name")]
+    pub pipe_name: String,
+    #[serde(default = "BridgeConfig::default_secret_version")]
+    pub secret_version: u32,
+    #[serde(default = "BridgeConfig::default_request_timeout_ms")]
+    pub request_timeout_ms: u32,
+    #[serde(default = "BridgeConfig::default_retry_interval_ms")]
+    pub retry_interval_ms: u32,
+}
+
+#[cfg(all(windows, feature = "vhd-bridge"))]
+impl BridgeConfig {
+    #[inline]
+    fn default_pipe_name() -> String {
+        // \\.\pipe\VHDMount.RustDeskBridge
+        "\\\\.\\pipe\\VHDMount.RustDeskBridge".to_owned()
+    }
+
+    #[inline]
+    fn default_secret_version() -> u32 {
+        // 真正的编译期注入值由根 crate 的 src/vhd_bridge/secret.rs 暴露；
+        // hbb_common 这一层只持有运行期默认占位，避免跨 crate 的 OUT_DIR 依赖。
+        1
+    }
+
+    #[inline]
+    fn default_request_timeout_ms() -> u32 {
+        5000
+    }
+
+    #[inline]
+    fn default_retry_interval_ms() -> u32 {
+        2000
+    }
+
+    /// Per Requirement 4.4: an empty or syntactically illegal `pipe_name`
+    /// must fall back to the default at the point of use. We treat any byte
+    /// below 0x20 (ASCII control characters, including NUL / LF / CR) as
+    /// illegal because Windows named pipe paths SHALL NOT contain them.
+    #[inline]
+    pub(crate) fn is_valid_pipe_name(name: &str) -> bool {
+        !name.is_empty() && !name.bytes().any(|b| b < 0x20)
+    }
+
+    /// Use-site fallback for `pipe_name` (Requirement 4.4).
+    ///
+    /// Returns the configured `pipe_name` borrowed when it is non-empty and
+    /// contains no control characters; otherwise returns an owned default.
+    /// SHALL NOT switch `Bridge_State` to `Disabled` / `Failed` regardless
+    /// of the field's current value — this fallback is purely lexical.
+    pub fn resolve_pipe_name(&self) -> std::borrow::Cow<'_, str> {
+        if Self::is_valid_pipe_name(&self.pipe_name) {
+            std::borrow::Cow::Borrowed(&self.pipe_name)
+        } else {
+            std::borrow::Cow::Owned(Self::default_pipe_name())
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "vhd-bridge"))]
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            pipe_name: Self::default_pipe_name(),
+            secret_version: Self::default_secret_version(),
+            request_timeout_ms: Self::default_request_timeout_ms(),
+            retry_interval_ms: Self::default_retry_interval_ms(),
+        }
+    }
+}
+
+// vhd-machine-auth-bridge: runtime-mutable Bridge_Config storage.
+//
+// Holds the current `BridgeConfig` instance for the process. Writes are
+// driven exclusively through `try_apply_bridge_option`, which validates
+// every incoming `(name, value)` pair against the rules in design.md
+// §"Bridge_Config" and Requirements 4.4 / 4.5 / 4.6 — illegal values fall
+// back to defaults with a `log::warn!`, kill-switch keys are dropped, and
+// `vhd-bridge-state` is treated as read-only.
+//
+// Lock acquisition is non-blocking and never crosses an `.await` (callers
+// read a clone via `current_bridge_config()` before any awaits), which is
+// consistent with AGENTS.md "do not hold locks across `.await`".
+#[cfg(all(windows, feature = "vhd-bridge"))]
+lazy_static::lazy_static! {
+    static ref BRIDGE_CONFIG: RwLock<BridgeConfig> = RwLock::new(BridgeConfig::default());
+}
+
+/// "Kill switch" keys that operators historically use to disable named
+/// IPC bridges. Per Requirement 4.5 the bridge is hard-coded enabled in
+/// the `vhd-bridge` feature build, so any attempt to write any of these
+/// SHALL be ignored with a `log::warn!`. The list intentionally covers
+/// both the verbatim names called out in Requirement 4.5
+/// (`vhd-bridge-enabled` / `enable-vhd-bridge`) and the negated forms an
+/// operator might try as a follow-up.
+#[cfg(all(windows, feature = "vhd-bridge"))]
+const VHD_BRIDGE_KILL_SWITCH_KEYS: &[&str] = &[
+    "vhd-bridge-enabled",
+    "enable-vhd-bridge",
+    "vhd-bridge-disable",
+    "disable-vhd-bridge",
+    "vhd-bridge-disabled",
+    "disable_vhd_bridge",
+    "enable_vhd_bridge",
+];
+
+/// Inclusive bounds applied to `request_timeout_ms` and `retry_interval_ms`
+/// per Requirement 4.4 / design.md §"Bridge_Config" data model. Out-of-range
+/// values fall back to the field default with a `log::warn!`.
+#[cfg(all(windows, feature = "vhd-bridge"))]
+const VHD_BRIDGE_DURATION_MIN_MS: u32 = 1;
+#[cfg(all(windows, feature = "vhd-bridge"))]
+const VHD_BRIDGE_DURATION_MAX_MS: u32 = 60_000;
+
+/// Validate and apply a single config-sync write targeting the
+/// `vhd-bridge-*` keyspace.
+///
+/// Caller responsibility: this function is invoked from the IPC config-sync
+/// path (`src/ipc.rs`) and from CLI / option-set code paths. It is `pub(crate)`
+/// because the only legitimate writers live inside this crate today; the
+/// public surface is the IPC config keys themselves.
+///
+/// Behavior (Requirements 4.4 / 4.5 / 4.6):
+/// - `vhd-bridge-pipe-name`: empty / control-char-bearing values fall back
+///   to the default and emit `log::warn!`.
+/// - `vhd-bridge-request-timeout-ms` / `vhd-bridge-retry-interval-ms`:
+///   values outside `[1, 60_000]` (or unparseable) fall back to the field
+///   default and emit `log::warn!`.
+/// - `vhd-bridge-secret-version`: stored as written if it parses as `u32`;
+///   unparseable values are ignored with a warn (worker side detects
+///   version mismatches via the handshake protocol).
+/// - `vhd-bridge-state`: writes are rejected (read-only observability key).
+/// - Kill-switch keys (see `VHD_BRIDGE_KILL_SWITCH_KEYS`): dropped with a
+///   warn; the bridge cannot be runtime-disabled in this build.
+/// - Any other key: returns without changes — non-bridge keys are routed
+///   elsewhere by the caller and SHALL NOT touch `BridgeConfig`.
+#[cfg(all(windows, feature = "vhd-bridge"))]
+pub(crate) fn try_apply_bridge_option(name: &str, value: &str) {
+    use keys::{
+        VHD_BRIDGE_PIPE_NAME, VHD_BRIDGE_REQUEST_TIMEOUT, VHD_BRIDGE_RETRY_INTERVAL,
+        VHD_BRIDGE_SECRET_VERSION, VHD_BRIDGE_STATE,
+    };
+
+    if VHD_BRIDGE_KILL_SWITCH_KEYS.contains(&name) {
+        log::warn!(
+            "vhd_bridge: ignoring kill-switch key '{}'; bridge is hard-enabled in this build",
+            name
+        );
+        return;
+    }
+
+    if name == VHD_BRIDGE_STATE {
+        log::warn!(
+            "vhd_bridge: '{}' is a read-only observability key; write rejected",
+            name
+        );
+        return;
+    }
+
+    // Take the write lock for the smallest possible window. We never hold
+    // it across an `.await` — this is a synchronous mutation path.
+    let mut cfg = match BRIDGE_CONFIG.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    match name {
+        VHD_BRIDGE_PIPE_NAME => {
+            if BridgeConfig::is_valid_pipe_name(value) {
+                cfg.pipe_name = value.to_owned();
+            } else {
+                log::warn!(
+                    "vhd_bridge: invalid pipe_name (empty or contains control chars); falling back to default"
+                );
+                cfg.pipe_name = BridgeConfig::default_pipe_name();
+            }
+        }
+        VHD_BRIDGE_REQUEST_TIMEOUT => match value.parse::<u32>() {
+            Ok(n) if (VHD_BRIDGE_DURATION_MIN_MS..=VHD_BRIDGE_DURATION_MAX_MS).contains(&n) => {
+                cfg.request_timeout_ms = n;
+            }
+            _ => {
+                log::warn!(
+                    "vhd_bridge: request_timeout_ms out of [{}, {}]; falling back to default",
+                    VHD_BRIDGE_DURATION_MIN_MS,
+                    VHD_BRIDGE_DURATION_MAX_MS
+                );
+                cfg.request_timeout_ms = BridgeConfig::default_request_timeout_ms();
+            }
+        },
+        VHD_BRIDGE_RETRY_INTERVAL => match value.parse::<u32>() {
+            Ok(n) if (VHD_BRIDGE_DURATION_MIN_MS..=VHD_BRIDGE_DURATION_MAX_MS).contains(&n) => {
+                cfg.retry_interval_ms = n;
+            }
+            _ => {
+                log::warn!(
+                    "vhd_bridge: retry_interval_ms out of [{}, {}]; falling back to default",
+                    VHD_BRIDGE_DURATION_MIN_MS,
+                    VHD_BRIDGE_DURATION_MAX_MS
+                );
+                cfg.retry_interval_ms = BridgeConfig::default_retry_interval_ms();
+            }
+        },
+        VHD_BRIDGE_SECRET_VERSION => match value.parse::<u32>() {
+            Ok(n) => cfg.secret_version = n,
+            Err(_) => {
+                log::warn!(
+                    "vhd_bridge: secret_version is not a u32; ignoring write"
+                );
+            }
+        },
+        _ => {
+            // Not a bridge key. Caller is responsible for routing; we do
+            // not record anything to avoid log spam on hot config-sync paths.
+        }
+    }
+}
+
+/// Snapshot read of the current `BridgeConfig`.
+///
+/// Returns a clone so callers can `await` afterwards without holding the
+/// internal `RwLock`. Used by the worker, by `resolve_pipe_name` consumers,
+/// and by the `vhd-bridge-state` observability path (later tasks).
+#[cfg(all(windows, feature = "vhd-bridge"))]
+pub fn current_bridge_config() -> BridgeConfig {
+    match BRIDGE_CONFIG.read() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+// vhd-machine-auth-bridge task 22.1: debug-build-only public wrapper
+// around `try_apply_bridge_option`. Integration tests in the root
+// crate's `tests/` directory live in their own crate and cannot
+// reach the `pub(crate)` writer; this thin `pub` alias is gated by
+// `cfg(debug_assertions)` so a release build never compiles it.
+//
+// Behavior is intentionally identical to `try_apply_bridge_option`:
+// every validation rule (Requirement 4.4 / 4.5 / 4.6) still applies,
+// and tests that pass nonsense values therefore observe the same
+// fallback semantics production does.
+#[cfg(all(windows, feature = "vhd-bridge", debug_assertions))]
+pub fn test_apply_bridge_option(name: &str, value: &str) {
+    try_apply_bridge_option(name, value);
+}
+
+// vhd-machine-auth-bridge task 9.1 / Requirements 7.2, 13.7, 14.6:
+// Observer-only callback hook for `Config::set_id` write completion.
+//
+// The bridge worker (`src/vhd_bridge/triggers.rs::notify_id_change`) lives
+// in the root crate. Calling it directly from `hbb_common` would be a
+// crate-level circular dependency, so the root crate registers a function
+// pointer here at startup (task 14.1) via `set_id_hook(...)`; until then
+// the hook stays empty and `Config::set_id` skips the call silently. This
+// keeps Requirement 13.7's "SHALL NOT modify existing ID generation /
+// persistence logic, only attach as observer" invariant intact and avoids
+// any blocking work on the ID-write path (Requirement 7.9 is enforced by
+// the root-crate side, which only does a non-blocking `try_send`).
+//
+// `OnceLock<fn()>` was chosen over `Mutex`/`RwLock` to guarantee the
+// invocation in `set_id` is allocation-free and lock-free; over `AtomicPtr`
+// because the hook is set exactly once during process init.
+#[cfg(all(target_os = "windows", feature = "vhd-bridge"))]
+pub(crate) static SET_ID_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register the `Config::set_id` observer callback.
+///
+/// Called once by the root crate's `vhd_bridge::start(...)` (task 14.1)
+/// with `vhd_bridge::triggers::notify_id_change` as the argument. Only
+/// the first registration is recorded; subsequent calls are silently
+/// ignored to keep startup idempotent.
+///
+/// SHALL NOT block. SHALL NOT panic.
+#[cfg(all(target_os = "windows", feature = "vhd-bridge"))]
+pub fn set_id_hook(f: fn()) {
+    let _ = SET_ID_HOOK.set(f);
 }
 
 pub mod keys {
@@ -2991,6 +3593,20 @@ pub mod keys {
     pub const OPTION_PROXY_URL: &str = "proxy-url";
     pub const OPTION_PROXY_USERNAME: &str = "proxy-username";
     pub const OPTION_PROXY_PASSWORD: &str = "proxy-password";
+
+    // vhd-machine-auth-bridge: Bridge_Config 与 vhd-bridge-state 观测键
+    // 仅在 RustDesk_Controlled (Windows + vhd-bridge feature) 形态下编译进产物，
+    // 与 Requirement 1.2 / 4.1 / 14.2 一致，避免主控端 / 中继产物携带相关字面量。
+    #[cfg(all(windows, feature = "vhd-bridge"))]
+    pub const VHD_BRIDGE_PIPE_NAME: &str = "vhd-bridge-pipe-name";
+    #[cfg(all(windows, feature = "vhd-bridge"))]
+    pub const VHD_BRIDGE_SECRET_VERSION: &str = "vhd-bridge-secret-version";
+    #[cfg(all(windows, feature = "vhd-bridge"))]
+    pub const VHD_BRIDGE_REQUEST_TIMEOUT: &str = "vhd-bridge-request-timeout-ms";
+    #[cfg(all(windows, feature = "vhd-bridge"))]
+    pub const VHD_BRIDGE_RETRY_INTERVAL: &str = "vhd-bridge-retry-interval-ms";
+    #[cfg(all(windows, feature = "vhd-bridge"))]
+    pub const VHD_BRIDGE_STATE: &str = "vhd-bridge-state";
 
     // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
     pub const KEYS_DISPLAY_SETTINGS: &[&str] = &[
@@ -3542,5 +4158,509 @@ mod tests {
         let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
         let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
         assert_ne!(non_service_root, non_service_user);
+    }
+
+    // vhd-machine-auth-bridge §18.2 / Requirement 21.3 — the
+    // `Config::set_option` and `Config::set_options` write entry-points
+    // SHALL refuse `"2fa"` and `OPTION_ENABLE_TRUSTED_DEVICES` under the
+    // `controlled-only` / `vhd-bridge` feature flavors so that neither a
+    // persisted config, an IPC config-sync push, a CLI flag, nor
+    // `HARD_SETTINGS` can re-enable 2FA / trusted-devices behind §18.1's
+    // `get_2fa` collapse. This test pins both the single-key write path
+    // and the predicate that the bulk path uses to strip disallowed
+    // entries before persistence; we avoid driving `set_options`
+    // directly because it replaces the whole `CONFIG2.options` map and
+    // would race with `test_overwrite_settings` over the process-global.
+    #[test]
+    #[cfg(any(feature = "controlled-only", feature = "vhd-bridge"))]
+    fn test_set_option_refuses_2fa_related_keys() {
+        // Pre-clean only the two keys this test touches so we don't
+        // disturb other tests sharing `CONFIG2.options`.
+        {
+            let mut config = CONFIG2.write().unwrap();
+            config.options.remove("2fa");
+            config.options.remove(keys::OPTION_ENABLE_TRUSTED_DEVICES);
+        }
+
+        // Single-key write path: a non-empty value SHALL be dropped, the
+        // key SHALL NOT appear in `CONFIG2.options`, and the read path
+        // SHALL observe the constant empty string.
+        Config::set_option("2fa".to_owned(), "totp-secret".to_owned());
+        Config::set_option(
+            keys::OPTION_ENABLE_TRUSTED_DEVICES.to_owned(),
+            "Y".to_owned(),
+        );
+        {
+            let config = CONFIG2.read().unwrap();
+            assert!(
+                !config.options.contains_key("2fa"),
+                "controlled-only/vhd-bridge: '2fa' write must be refused"
+            );
+            assert!(
+                !config
+                    .options
+                    .contains_key(keys::OPTION_ENABLE_TRUSTED_DEVICES),
+                "controlled-only/vhd-bridge: '{}' write must be refused",
+                keys::OPTION_ENABLE_TRUSTED_DEVICES
+            );
+        }
+        assert_eq!(Config::get_option("2fa"), "");
+        assert_eq!(Config::get_option(keys::OPTION_ENABLE_TRUSTED_DEVICES), "");
+
+        // Bulk write path (covers IPC config-sync `Data::Options` and
+        // remote `Config::set_options`): the predicate `set_options`
+        // uses to strip disallowed entries is `is_2fa_disabled_option_key`.
+        // Pin it positively for the two disabled keys and negatively for
+        // a few representative neighbours so a future rename / typo of
+        // either constant is caught at compile-and-test time.
+        assert!(super::is_2fa_disabled_option_key("2fa"));
+        assert!(super::is_2fa_disabled_option_key(
+            keys::OPTION_ENABLE_TRUSTED_DEVICES
+        ));
+        assert!(!super::is_2fa_disabled_option_key(""));
+        assert!(!super::is_2fa_disabled_option_key("2fa-something"));
+        assert!(!super::is_2fa_disabled_option_key(
+            keys::OPTION_ENABLE_DIRECTX_CAPTURE
+        ));
+        assert!(!super::is_2fa_disabled_option_key("temporary-password"));
+    }
+
+    // vhd-machine-auth-bridge §18.3 / Requirement 21.5 — under the
+    // `controlled-only` / `vhd-bridge` build forms the four trusted-device
+    // entry-points SHALL collapse to no-ops:
+    //   * `get_trusted_devices` returns an empty `Vec` (read path)
+    //   * `get_trusted_devices_json` returns the literal `"[]"`
+    //   * `add_trusted_device` / `remove_trusted_devices` /
+    //     `clear_trusted_devices` SHALL NOT mutate any state observable
+    //     through `get_trusted_devices`.
+    // Together with §18.2, this severs both the option-toggle and the
+    // hwid-cache halves of the legacy 2FA "trusted devices" mechanism so
+    // §19's "password + operator approval" gate stays the only authority.
+    #[test]
+    #[cfg(any(feature = "controlled-only", feature = "vhd-bridge"))]
+    fn test_trusted_devices_apis_are_noops_under_cropped_form() {
+        // Read path: empty `Vec` and `"[]"` JSON, irrespective of any
+        // pre-existing in-memory `TRUSTED_DEVICES` cache.
+        assert!(
+            Config::get_trusted_devices().is_empty(),
+            "controlled-only/vhd-bridge: get_trusted_devices must be empty"
+        );
+        assert_eq!(
+            Config::get_trusted_devices_json(),
+            "[]",
+            "controlled-only/vhd-bridge: get_trusted_devices_json must be \"[]\""
+        );
+
+        // Write paths: invocation must not produce any device observable
+        // through the read path. We construct a `TrustedDevice` purely
+        // to drive the type-check; under the cropped form the value is
+        // dropped immediately by the no-op stub.
+        let device = TrustedDevice {
+            hwid: Bytes::from_static(b"\x01\x02\x03"),
+            time: crate::get_time(),
+            id: "test-id".to_owned(),
+            name: "test-name".to_owned(),
+            platform: "test-platform".to_owned(),
+        };
+        Config::add_trusted_device(device);
+        assert!(
+            Config::get_trusted_devices().is_empty(),
+            "controlled-only/vhd-bridge: add_trusted_device must be a no-op"
+        );
+
+        Config::remove_trusted_devices(&vec![Bytes::from_static(b"\x01\x02\x03")]);
+        assert!(
+            Config::get_trusted_devices().is_empty(),
+            "controlled-only/vhd-bridge: remove_trusted_devices must be a no-op"
+        );
+
+        Config::clear_trusted_devices();
+        assert!(
+            Config::get_trusted_devices().is_empty(),
+            "controlled-only/vhd-bridge: clear_trusted_devices must be a no-op"
+        );
+        assert_eq!(
+            Config::get_trusted_devices_json(),
+            "[]",
+            "controlled-only/vhd-bridge: get_trusted_devices_json must remain \"[]\" after writes"
+        );
+    }
+}
+
+// vhd-machine-auth-bridge: property tests for `try_apply_bridge_option`.
+//
+// **Property 11: Configuration writes never disable the bridge**
+// (Validates: Requirements 4.2, 4.4, 4.5, 4.6.)
+//
+// `Bridge_State` lives in the root crate (`src/vhd_bridge/observability.rs`)
+// and is not visible from `hbb_common`. What this layer CAN — and SHALL —
+// guarantee is:
+//   (a) `try_apply_bridge_option` never panics and always leaves
+//       `BRIDGE_CONFIG.resolve_pipe_name()` returning a non-empty,
+//       control-char-free path; this is the structural prerequisite for
+//       the worker NOT to be forced into `Disabled` / `Failed` by a
+//       configuration write.
+//   (b) Any kill-switch key (the negated forms operators historically use
+//       to disable a bridge) is dropped without mutating `BridgeConfig`
+//       byte-for-byte.
+//   (c) Invalid `pipe_name` writes (empty / control chars) fall back to
+//       the default at `resolve_pipe_name()` use-site, never propagating
+//       to a state-machine transition.
+//   (d) Writes to the read-only `vhd-bridge-state` observability key are
+//       rejected without mutating `BridgeConfig`.
+//
+// `BRIDGE_CONFIG` is a process-global. proptest cases inside one
+// `proptest!` block run sequentially, but separate property functions
+// can run in parallel — we serialize all of them through a single test
+// `Mutex` to keep the global lock-step deterministic. We poison-tolerate
+// the lock the same way the production path does.
+#[cfg(test)]
+#[cfg(all(windows, feature = "vhd-bridge"))]
+mod bridge_config_property_tests {
+    use super::keys::{
+        VHD_BRIDGE_PIPE_NAME, VHD_BRIDGE_REQUEST_TIMEOUT, VHD_BRIDGE_RETRY_INTERVAL,
+        VHD_BRIDGE_SECRET_VERSION, VHD_BRIDGE_STATE,
+    };
+    use super::{
+        current_bridge_config, try_apply_bridge_option, BridgeConfig, BRIDGE_CONFIG,
+        VHD_BRIDGE_KILL_SWITCH_KEYS,
+    };
+    use proptest::prelude::*;
+    use std::sync::Mutex;
+
+    /// Serializes test cases against the process-global `BRIDGE_CONFIG`.
+    /// proptest runs cases inside one `proptest!` block sequentially, but
+    /// distinct property functions can run on different threads — without
+    /// this guard the global would be torn between tests.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Resets `BRIDGE_CONFIG` to its default — the byte-level baseline
+    /// every property case starts from.
+    fn reset_to_default() {
+        let mut g = match BRIDGE_CONFIG.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *g = BridgeConfig::default();
+    }
+
+    /// Default pipe path constant; mirrors `BridgeConfig::default_pipe_name`
+    /// but kept inline so the test pins the spec text byte-for-byte rather
+    /// than echoing whatever the default function returns.
+    const DEFAULT_PIPE_NAME: &str = "\\\\.\\pipe\\VHDMount.RustDeskBridge";
+
+    proptest! {
+        // Property 11b: Any kill-switch key write SHALL leave `BridgeConfig`
+        // byte-level unchanged, regardless of the value payload.
+        // (Validates: Requirements 4.2, 4.5.)
+        #[test]
+        fn kill_switch_keys_never_mutate_config(value in any::<String>()) {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_to_default();
+            let before = current_bridge_config();
+            for &key in VHD_BRIDGE_KILL_SWITCH_KEYS {
+                try_apply_bridge_option(key, &value);
+            }
+            let after = current_bridge_config();
+            prop_assert_eq!(before, after);
+        }
+
+        // `vhd-bridge-state` is a read-only observability key (Requirement
+        // 4.5). Any write SHALL be rejected and SHALL NOT mutate config.
+        // (Validates: Requirement 4.5.)
+        #[test]
+        fn vhd_bridge_state_writes_are_rejected(value in any::<String>()) {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_to_default();
+            let before = current_bridge_config();
+            try_apply_bridge_option(VHD_BRIDGE_STATE, &value);
+            prop_assert_eq!(before, current_bridge_config());
+        }
+
+        // Property 11c: `pipe_name` writes containing only control chars
+        // (or an empty string) are illegal per `is_valid_pipe_name`. They
+        // SHALL fall back to the default at `resolve_pipe_name()` use-site
+        // and SHALL NOT propagate the illegal value.
+        // (Validates: Requirement 4.4.)
+        #[test]
+        fn invalid_pipe_name_resolves_to_default(
+            value in prop::string::string_regex(r"[\x00-\x1F]{0,32}").unwrap(),
+        ) {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_to_default();
+            try_apply_bridge_option(VHD_BRIDGE_PIPE_NAME, &value);
+            let cfg = current_bridge_config();
+            let resolved = cfg.resolve_pipe_name();
+            prop_assert_eq!(resolved.as_ref(), DEFAULT_PIPE_NAME);
+        }
+
+        // Complement of the previous: a valid (non-empty, control-char-free)
+        // `pipe_name` SHALL be preserved verbatim by the resolver. This
+        // pins the "valid path is honored" half of Requirement 4.4 so the
+        // fallback is not over-eagerly applied.
+        // (Validates: Requirement 4.4.)
+        #[test]
+        fn valid_pipe_name_is_preserved(
+            value in prop::string::string_regex(r"[\x20-\x7e]{1,200}").unwrap(),
+        ) {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_to_default();
+            try_apply_bridge_option(VHD_BRIDGE_PIPE_NAME, &value);
+            let cfg = current_bridge_config();
+            let resolved = cfg.resolve_pipe_name();
+            prop_assert_eq!(resolved.as_ref(), value.as_str());
+        }
+
+        // Property 11a (timeout half): For ANY i64 written as a string the
+        // post-condition `request_timeout_ms ∈ [1, 60_000]` SHALL hold.
+        // Either the value parsed as u32 in range (stored), or it fell
+        // back to the default 5000 (in range) — never a 0/out-of-range
+        // value that would push the worker into a tight reconnect loop.
+        // (Validates: Requirement 4.4.)
+        #[test]
+        fn out_of_range_timeout_falls_back(value in any::<i64>()) {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_to_default();
+            let s = value.to_string();
+            try_apply_bridge_option(VHD_BRIDGE_REQUEST_TIMEOUT, &s);
+            let cfg = current_bridge_config();
+            prop_assert!((1..=60_000).contains(&cfg.request_timeout_ms));
+        }
+
+        // Same shape as above, applied to `retry_interval_ms`.
+        // (Validates: Requirement 4.4.)
+        #[test]
+        fn out_of_range_retry_interval_falls_back(value in any::<i64>()) {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_to_default();
+            let s = value.to_string();
+            try_apply_bridge_option(VHD_BRIDGE_RETRY_INTERVAL, &s);
+            let cfg = current_bridge_config();
+            prop_assert!((1..=60_000).contains(&cfg.retry_interval_ms));
+        }
+
+        // Property 11a (composite half): For an arbitrary sequence of
+        // `(key, value)` writes — drawn from the bridge keyspace, the
+        // kill-switch set, and arbitrary noise — `try_apply_bridge_option`
+        // SHALL NOT panic and SHALL leave the post-state in a "bridge can
+        // keep running" shape: `resolve_pipe_name()` returns a non-empty
+        // path with no control chars, and the two duration fields stay
+        // inside `[1, 60_000]`. This is the structural invariant that
+        // prevents `Bridge_State` from being forced to `Disabled` or
+        // `Failed` by configuration alone (Requirements 4.2 / 4.6).
+        #[test]
+        fn arbitrary_write_sequence_keeps_bridge_runnable(
+            ops in proptest::collection::vec(
+                (
+                    // Key: bias toward bridge keys & kill-switch keys, with
+                    // a tail of arbitrary strings to model garbage writes.
+                    prop_oneof![
+                        Just(VHD_BRIDGE_PIPE_NAME.to_owned()),
+                        Just(VHD_BRIDGE_REQUEST_TIMEOUT.to_owned()),
+                        Just(VHD_BRIDGE_RETRY_INTERVAL.to_owned()),
+                        Just(VHD_BRIDGE_SECRET_VERSION.to_owned()),
+                        Just(VHD_BRIDGE_STATE.to_owned()),
+                        prop::sample::select(VHD_BRIDGE_KILL_SWITCH_KEYS.to_vec())
+                            .prop_map(|s| s.to_owned()),
+                        any::<String>(),
+                    ],
+                    any::<String>(),
+                ),
+                0..32,
+            ),
+        ) {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_to_default();
+            for (k, v) in &ops {
+                try_apply_bridge_option(k, v);
+            }
+            let cfg = current_bridge_config();
+
+            // (a) resolve_pipe_name() always yields a usable pipe path.
+            let resolved = cfg.resolve_pipe_name();
+            prop_assert!(!resolved.is_empty());
+            prop_assert!(!resolved.bytes().any(|b| b < 0x20));
+
+            // (b) duration fields stay in the documented bound, never 0
+            //     or > 60_000 — these are the values the worker will hand
+            //     to `tokio::time::timeout` and the reconnect scheduler.
+            prop_assert!((1..=60_000).contains(&cfg.request_timeout_ms));
+            prop_assert!((1..=60_000).contains(&cfg.retry_interval_ms));
+        }
+    }
+}
+
+// vhd-machine-auth-bridge: property tests for `BridgeConfig` serialization.
+//
+// **Property 13: BridgeConfig serialization never includes the shared secret**
+// (Validates: Requirements 3.7, 10.6, 13.6.)
+//
+// `RustDeskClientSharedSecret` lives in the root crate
+// (`src/vhd_bridge/secret.rs`) — its 32 bytes are not visible from
+// `hbb_common`, so we cannot check "the secret bytes never appear in the
+// serialization" directly from this layer. What this layer CAN — and
+// SHALL — guarantee is the *structural* invariant that makes a leak
+// impossible by construction:
+//
+//   (a) `BridgeConfig` serializes to a JSON object whose key set is
+//       EXACTLY {pipe_name, secret_version, request_timeout_ms,
+//       retry_interval_ms}. Any future field addition trips this test
+//       and forces a security review (Requirement 13.6).
+//   (b) None of the keys carry a "secret-like" name — i.e. they are
+//       not in the forbidden set {proof, mac, shared_secret, secret,
+//       password, ...}. The only allowed crypto-related field is the
+//       integer `secret_version` (Requirement 3.7, 10.6).
+//   (c) Serialization is round-trip-stable so cargo / IPC paths do
+//       not silently drop or rename fields.
+//
+// `serde_json::to_string` is the only encoding in scope from this layer:
+// `src/ipc.rs` itself uses `serde_json::to_vec` for `Data` frames (no
+// bincode in this codebase), and `hbb_common`'s on-disk config is TOML.
+// Neither encoding can leak more than what the JSON key set does.
+//
+// `BRIDGE_CONFIG` global is not touched here — these tests construct
+// fresh `BridgeConfig` values per case and never go through the global.
+#[cfg(test)]
+#[cfg(all(windows, feature = "vhd-bridge"))]
+mod bridge_config_serde_property_tests {
+    use super::BridgeConfig;
+    use proptest::prelude::*;
+
+    /// Field names that SHALL NOT appear as JSON keys in a `BridgeConfig`
+    /// serialization. These cover every secret-bearing or HMAC-bearing
+    /// identifier the protocol uses; if any of them shows up as a
+    /// `BridgeConfig` field name, the serialization path is by definition
+    /// leaking what Requirements 3.7 / 10.6 forbid.
+    const FORBIDDEN_FIELD_NAMES: &[&str] = &[
+        "proof",
+        "mac",
+        "secret",
+        "shared_secret",
+        "sharedSecret",
+        "rust_desk_client_shared_secret",
+        "rustDeskClientSharedSecret",
+        "RustDeskClientSharedSecret",
+        "password",
+        "hmac",
+        "key",
+    ];
+
+    /// The exact set of JSON keys a `BridgeConfig` is allowed to expose.
+    /// Mirrors design.md §"Bridge_Config" Data Model — must stay in sync
+    /// with `BridgeConfig` itself.
+    const ALLOWED_FIELD_NAMES: &[&str] = &[
+        "pipe_name",
+        "secret_version",
+        "request_timeout_ms",
+        "retry_interval_ms",
+    ];
+
+    /// Structural invariant: a `Default::default()` `BridgeConfig`
+    /// serializes to a JSON object whose key set equals
+    /// `ALLOWED_FIELD_NAMES`. Any drift in the struct definition trips
+    /// this test and forces a security review per Requirement 13.6.
+    #[test]
+    fn default_bridge_config_field_set_matches_spec() {
+        let cfg = BridgeConfig::default();
+        let value = serde_json::to_value(&cfg).expect("BridgeConfig serializes");
+        let obj = value
+            .as_object()
+            .expect("BridgeConfig SHALL serialize as a JSON object");
+        let keys: std::collections::BTreeSet<&str> =
+            obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ALLOWED_FIELD_NAMES.iter().copied().collect();
+        assert_eq!(
+            keys, expected,
+            "BridgeConfig field set drifted; review for secret leak per R13.6"
+        );
+        // Belt-and-suspenders: explicitly assert the count to catch any
+        // duplicate-key oddities serde_json might surface in the future.
+        assert_eq!(obj.len(), 4);
+    }
+
+    proptest! {
+        // Property 13a: For an arbitrary `BridgeConfig` value, the
+        // `serde_json` output's key set SHALL equal `ALLOWED_FIELD_NAMES`
+        // and SHALL NOT intersect `FORBIDDEN_FIELD_NAMES`.
+        // (Validates: Requirements 3.7, 10.6, 13.6.)
+        #[test]
+        fn arbitrary_bridge_config_keys_are_safe(
+            // pipe_name regex deliberately allows characters that would
+            // textually look like a forbidden substring (e.g. "mac",
+            // "proof", "secret"). This guards against the naive "search
+            // the JSON text for forbidden words" check, which would
+            // false-positive whenever pipe_name *value* happens to contain
+            // those bytes — we only care about field *names*.
+            pipe_name in r"[\x20-\x7e]{0,200}",
+            secret_version in any::<u32>(),
+            request_timeout_ms in 1u32..=60_000,
+            retry_interval_ms in 1u32..=60_000,
+        ) {
+            let cfg = BridgeConfig {
+                pipe_name,
+                secret_version,
+                request_timeout_ms,
+                retry_interval_ms,
+            };
+            let value = serde_json::to_value(&cfg)
+                .expect("BridgeConfig SHALL serialize without error");
+            let obj = value
+                .as_object()
+                .expect("BridgeConfig SHALL serialize as a JSON object");
+
+            // (1) Key set is EXACTLY the documented four. No more, no less.
+            let keys: std::collections::BTreeSet<&str> =
+                obj.keys().map(String::as_str).collect();
+            let expected: std::collections::BTreeSet<&str> =
+                ALLOWED_FIELD_NAMES.iter().copied().collect();
+            prop_assert_eq!(keys, expected);
+
+            // (2) No key intersects the forbidden set. This is implied by
+            // (1) given the current ALLOWED_FIELD_NAMES, but stated
+            // explicitly so a future field rename that shadows a forbidden
+            // name (e.g. someone adds `secret`) is caught even if
+            // ALLOWED_FIELD_NAMES is updated in lockstep without thinking.
+            for forbidden in FORBIDDEN_FIELD_NAMES {
+                prop_assert!(
+                    !obj.contains_key(*forbidden),
+                    "BridgeConfig leaked forbidden field name '{}'",
+                    forbidden
+                );
+            }
+
+            // (3) The only crypto-related field exposed is the integer
+            // `secret_version` (Requirement 3.7 / 10.6 / 12.3 last clause).
+            // It SHALL be a JSON number, not a stringified secret payload.
+            let sv = obj.get("secret_version").expect("secret_version present");
+            prop_assert!(
+                sv.is_number(),
+                "secret_version SHALL be a JSON number, got {:?}",
+                sv
+            );
+        }
+
+        // Property 13b: `serde_json` round-trip is identity for any
+        // `BridgeConfig`. Locks the encode→decode path so future field
+        // additions can't silently drop a value through a stale `default`
+        // attribute.
+        // (Validates: Requirement 13.6.)
+        #[test]
+        fn bridge_config_json_round_trip_is_identity(
+            pipe_name in r"[\x20-\x7e]{0,200}",
+            secret_version in any::<u32>(),
+            request_timeout_ms in 1u32..=60_000,
+            retry_interval_ms in 1u32..=60_000,
+        ) {
+            let cfg = BridgeConfig {
+                pipe_name,
+                secret_version,
+                request_timeout_ms,
+                retry_interval_ms,
+            };
+            let json = serde_json::to_string(&cfg).expect("encode");
+            let parsed: BridgeConfig = serde_json::from_str(&json).expect("decode");
+            prop_assert_eq!(cfg, parsed);
+        }
     }
 }

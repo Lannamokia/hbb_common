@@ -9,6 +9,17 @@ edition = "2018"
 [features]
 default = []
 webrtc = ["dep:webrtc"]
+# vhd-machine-auth-bridge: features pass-through，使根 crate 启用 vhd-bridge 时
+# hbb_common 内的 cfg(feature = "vhd-bridge") 守卫可见。
+# 复用既有 sha2 / rand；hmac (0.12) 在 vhd-bridge 启用时通过 dep:hmac 拉入并由
+# lib.rs 重新导出，使 src/vhd_bridge/hmac.rs 走 hbb_common::hmac 路径，避免在
+# 根 crate 直接引入新密码学 crate（任务 4.2）。
+vhd-bridge = ["dep:hmac"]
+# vhd-machine-auth-bridge: features pass-through for `controlled-only`，使
+# `libs/hbb_common/src/config.rs` 内的 `cfg(feature = "controlled-only")` 守卫
+# 在根 crate 启用裁剪特性时可见（任务 17.4：裁剪最近 / 收藏 / 地址簿 /
+# 主动 LAN 发现持久化与读取路径）。
+controlled-only = []
 
 [dependencies]
 # new flexi_logger failed on rustc 1.75
@@ -50,6 +61,13 @@ httparse = "1.10"
 base64 = "0.22"
 url = "2.5"
 sha2 = "0.10"
+# vhd-machine-auth-bridge: HMAC-SHA256 helper for src/vhd_bridge/hmac.rs.
+# Pulled in only when the root crate enables `vhd-bridge`; re-exported
+# via `pub use hmac;` in lib.rs so the bridge can write
+# `hbb_common::hmac::Hmac` per task 4.2 ("复用既有 hmac/sha2"). Already
+# present transitively (hkdf -> hmac) so this does not add a new crate
+# to the dependency graph.
+hmac = { version = "0.12", optional = true }
 whoami = "1.5"
 
 tokio-rustls = { version = "0.26", features = [
@@ -75,10 +93,19 @@ machine-uid = { git = "https://github.com/rustdesk-org/machine-uid" }
 
 [build-dependencies]
 protobuf-codegen = { version = "3.7" }
+# vhd-machine-auth-bridge §1.2b: same Build_Prereq_Vars resolver as the root
+# build.rs — emits `cargo:rustc-env=RUSTDESK_RS_PUB_KEY` / `..RENDEZVOUS_SERVER`
+# / `..RELAY_SERVER` for the `option_env!` consumers in `src/config.rs`.
+# Pure helpers, no external deps.
+build_support = { path = "../build_support" }
 
 [dev-dependencies]
 clap = "4.5.51"
 webrtc = "0.14.0"
+# vhd-machine-auth-bridge: PBT runner for Property 11 / 13 / 21 etc.
+# design.md §"Library selection" pins proptest = "1" as dev-only; no
+# runtime dependency is added.
+proptest = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = [

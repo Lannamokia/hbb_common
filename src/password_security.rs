@@ -32,6 +32,32 @@ fn get_auto_password() -> String {
 // Should only be called in server
 pub fn update_temporary_password() {
     *TEMPORARY_PASSWORD.write().unwrap() = get_auto_password();
+    // vhd-machine-auth-bridge (task 9.2 / Requirement 7.3 / 14.6):
+    // notify the bridge worker that a fresh temporary password just
+    // landed. Registered by the root crate's `vhd_bridge` module
+    // (task 14.1) via `password_change_hook(...)`; absent the
+    // registration this is a single relaxed atomic load → no-op.
+    #[cfg(all(target_os = "windows", feature = "vhd-bridge"))]
+    if let Some(f) = PASSWORD_CHANGE_HOOK.get() { f(); }
+}
+
+// vhd-machine-auth-bridge (task 9.2): observation hook fired by
+// `update_temporary_password()` after a successful write. The hook is
+// registered exactly once during process bring-up by the root crate's
+// `vhd_bridge::start()` path (task 14.1) so the bridge can stay an
+// observer-only component without `hbb_common` taking a hard
+// dependency on it. A second registration is silently ignored — the
+// first registration wins, which keeps the call site fast-path
+// branchless once the bridge worker is up.
+#[cfg(all(target_os = "windows", feature = "vhd-bridge"))]
+static PASSWORD_CHANGE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register the `update_temporary_password` write-completion hook.
+/// Called once from `vhd_bridge::start()` (task 14.1). Idempotent: a
+/// second invocation has no effect.
+#[cfg(all(target_os = "windows", feature = "vhd-bridge"))]
+pub fn password_change_hook(f: fn()) {
+    let _ = PASSWORD_CHANGE_HOOK.set(f);
 }
 
 // Should only be called in server
