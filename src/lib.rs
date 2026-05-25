@@ -501,7 +501,30 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
         {
             // https://docs.rs/flexi_logger/latest/flexi_logger/error_info/index.html#write
             // though async logger more efficient, but it also causes more problems, disable it for now
+            //
+            // vhd-machine-auth-bridge: write log files next to the running
+            // executable rather than into the user-profile log_path().
+            // Pure Windows-service deployments run as LocalSystem with no
+            // user profile to navigate to, and operators have explicitly
+            // asked for `<exe-dir>\logs\` so they can find the log file
+            // by reading the install path off the SCM service entry. The
+            // service runs as LocalSystem so it has write access to its
+            // own install directory; if `current_exe()` fails or the
+            // directory is read-only, we fall back to the previous
+            // user-profile-based path so we never end up with a logger
+            // that silently fails to start.
+            #[cfg(all(target_os = "windows", feature = "vhd-bridge"))]
+            let mut path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("logs")))
+                .filter(|d| {
+                    std::fs::create_dir_all(d).is_ok()
+                })
+                .unwrap_or_else(config::Config::log_path);
+
+            #[cfg(not(all(target_os = "windows", feature = "vhd-bridge")))]
             let mut path = config::Config::log_path();
+
             #[cfg(target_os = "android")]
             if !config::Config::get_home().exists() {
                 return;
